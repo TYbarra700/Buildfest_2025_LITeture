@@ -1,0 +1,282 @@
+using UnityEngine;
+using System.IO.Ports;
+using System.Threading;
+using System.Linq;
+using System.Collections.Generic;
+using Datafeel;
+using Datafeel.Unity.Sdk;
+using Datafeel.Unity.Sdk.Samples;
+
+public class UltrasonicSensor : MonoBehaviour
+{
+    private SerialPort serialPort;
+    public volatile float detectedDistance = -1f; // Made public for debugging
+    private string currentRange = "";
+    private DatafeelService _datafeelService;
+    private Thread serialThread;
+    private bool isRunning = true;
+    private float currentTargetTemp = 27f;
+    private float lastVibrationIntensity = -1f;
+    private float lastVibrationFrequency = -1f;
+    private Color lastLEDColor = Color.black;
+
+    [SerializeField] private AudioSource audioSource; // 🎵 Audio Source
+
+    // Median Filter Variables
+    private Queue<float> distanceQueue = new Queue<float>();
+    private int filterWindowSize = 5; // Number of past readings used for median
+
+    private void Start()
+    {
+        Debug.Log("UltrasonicSensor script started.");
+
+        serialPort = new SerialPort("COM8", 9600) { ReadTimeout = 500 };
+
+        try
+        {
+            serialPort.Open();
+            Debug.Log("Serial port opened successfully.");
+            serialThread = new Thread(ReadSerialData) { IsBackground = true };
+            serialThread.Start();
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"Failed to open serial port: {e.Message}");
+        }
+
+        _datafeelService = FindFirstObjectByType<DatafeelService>();
+        if (_datafeelService == null || !_datafeelService.Dots.Any())
+        {
+            Debug.LogError("No Dots detected in DatafeelService. Make sure they are connected.");
+            return;
+        }
+
+        Debug.Log("DatafeelService found. Enabling Dots...");
+        foreach (var dot in _datafeelService.Dots)
+        {
+            _datafeelService.EnableAutoUpdate(dot.Address);
+            Debug.Log($"Enabled AutoUpdate for Dot {dot.Address}");
+        }
+
+        // 🎵 Ensure Audio Starts Playing
+        if (audioSource != null)
+        {
+            audioSource.loop = true;
+            audioSource.Play();
+            Debug.Log("Audio source started.");
+        }
+        else
+        {
+            Debug.LogError("No AudioSource assigned! Please attach an AudioSource component.");
+        }
+    }
+
+    private void ReadSerialData()
+    {
+        while (isRunning)
+        {
+            try
+            {
+                if (serialPort.IsOpen && serialPort.BytesToRead > 0)
+                {
+                    string data = serialPort.ReadLine().Trim();
+
+                    if (float.TryParse(data, out float distance))
+                    {
+                        if (distance < 0 || distance > 200)
+                            continue;
+
+                        detectedDistance = GetMedianFilteredDistance(distance); // Apply Median Filtering
+                    }
+                }
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError($"Error reading serial data: {e.Message}");
+            }
+
+            Thread.Sleep(100);
+        }
+    }
+
+    private void Update()
+    {
+        if (detectedDistance < 0)
+            return;
+
+        // Display detected distance in the console
+        Debug.Log($"Filtered Distance: {detectedDistance} cm");
+
+        string newRange = GetRange(detectedDistance);
+
+        if (newRange != currentRange)
+        {
+            currentRange = newRange;
+            Debug.Log($"Range changed to: {currentRange}");
+            ApplyHapticSettings(currentRange);
+            AdjustAudioVolume(currentRange); // 🎵 Adjusts audio volume
+        }
+
+        ApplyHapticSettings(currentRange);
+        MaintainTemperature();
+    }
+
+    private string GetRange(float distance)
+    {
+        if (distance <= 20) return "Close Range";
+        if (distance <= 40) return "Medium Range";
+        if (distance <= 80) return "Far Range";
+        return "Unspecified";
+    }
+
+    private void ApplyHapticSettings(string range)
+    {
+        if (range == "Close Range") SetCloseRangeHaptics();
+        else if (range == "Medium Range") SetMediumRangeHaptics();
+        else if (range == "Far Range") SetFarRangeHaptics();
+    }
+
+    private void SetCloseRangeHaptics()
+    {
+        ApplyLEDColor(new Color(1f, 1f, 1f)); // White (255, 255, 255)
+        ApplyVibration(0.2f, 100);
+        currentTargetTemp = 27f;
+    }
+
+    private void SetMediumRangeHaptics()
+    {
+        ApplyLEDColor(new Color(1f, 0.41f, 0.71f)); // Pink
+        ApplyVibration(0.5f, 150);
+        currentTargetTemp = 34f;
+    }
+
+    private void SetFarRangeHaptics()
+    {
+        ApplyLEDColor(new Color(1f, 0f, 0f)); // Red
+        ApplyVibration(1.0f, 200);
+        currentTargetTemp = 38f;
+    }
+
+    private void ApplyVibration(float intensity, float frequency)
+    {
+        if (_datafeelService == null || !_datafeelService.Dots.Any()) return;
+
+        if (intensity == lastVibrationIntensity && frequency == lastVibrationFrequency)
+            return;
+
+        lastVibrationIntensity = intensity;
+        lastVibrationFrequency = frequency;
+
+        foreach (var dot in _datafeelService.Dots)
+        {
+            dot.VibrationMode = VibrationModes.Manual;
+            dot.VibrationIntensity = intensity;
+            dot.VibrationFrequency = frequency;
+
+            try
+            {
+                dot.Write(true, default);
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError($"Error writing to Dot {dot.Address}: {e.Message}");
+            }
+        }
+    }
+
+    private void ApplyLEDColor(Color color)
+    {
+        if (_datafeelService == null || !_datafeelService.Dots.Any()) return;
+
+        if (color == lastLEDColor)
+            return;
+
+        lastLEDColor = color;
+
+        foreach (var dot in _datafeelService.Dots)
+        {
+            dot.LedMode = LedModes.GlobalManual;
+            dot.GlobalLed.Red = (byte)(color.r * 255);
+            dot.GlobalLed.Green = (byte)(color.g * 255);
+            dot.GlobalLed.Blue = (byte)(color.b * 255);
+
+            try
+            {
+                dot.Write(true, default);
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError($"Error writing LED color: {e.Message}");
+            }
+        }
+    }
+
+    private void MaintainTemperature()
+    {
+        if (_datafeelService == null || !_datafeelService.Dots.Any()) return;
+
+        foreach (var dot in _datafeelService.Dots)
+        {
+            float currentTemp = dot.SkinTemperature ?? 27f;
+
+            if (Mathf.Abs(currentTemp - currentTargetTemp) <= 0.5f)
+                continue;
+
+            float newIntensity = currentTargetTemp > currentTemp ? 1.0f : -1.0f;
+
+            if (dot.ThermalIntensity == newIntensity)
+                continue;
+
+            dot.ThermalMode = Datafeel.ThermalModes.Manual;
+            dot.ThermalIntensity = newIntensity;
+
+            try
+            {
+                dot.Write(true, default);
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError($"Error writing temperature: {e.Message}");
+            }
+        }
+    }
+
+    // 🎵 Adjusts Audio Volume Based on Distance
+    private void AdjustAudioVolume(string range)
+    {
+        if (audioSource == null)
+        {
+            Debug.LogError("No AudioSource assigned. Skipping volume adjustment.");
+            return;
+        }
+
+        float volume = 1.0f; // Default to max
+
+        switch (range)
+        {
+            case "Far Range":
+                volume = 1.0f; // Max volume
+                break;
+            case "Medium Range":
+                volume = 0.5f; // Half volume
+                break;
+            case "Close Range":
+                volume = 0.0f; // Mute
+                break;
+        }
+
+        audioSource.volume = volume;
+        Debug.Log($"Audio volume adjusted to {volume} for {range}");
+    }
+
+    private float GetMedianFilteredDistance(float newReading)
+    {
+        distanceQueue.Enqueue(newReading);
+
+        if (distanceQueue.Count > filterWindowSize)
+            distanceQueue.Dequeue();
+
+        var sortedValues = distanceQueue.OrderBy(x => x).ToList();
+        return sortedValues[sortedValues.Count / 2]; // Return median value
+    }
+}
